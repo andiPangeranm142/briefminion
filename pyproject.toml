@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "briefminion"
+version = "0.1.0"
+description = "A research-brief agent built on the OpenMinion 0.1 Python SDK (Cortensor Hackathon #5)."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Andi Pangeran", email = "andijiphone@gmail.com" }]
+dependencies = [
+    "openminion==0.1.22",
+    "pydantic>=2.0",
+]
+
+[project.scripts]
+briefminion = "briefminion.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
