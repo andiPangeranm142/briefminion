@@ -9,8 +9,11 @@ One brief run has four phases, each a separate Agent sharing one session:
    then returns the brief as validated structured output.
 4. Save — the agent calls the approval-gated ``save_brief`` tool.
 
-Phases 2-4 have deterministic fallbacks (logged in the run record) so a
-flaky free-tier model degrades the run instead of killing it.
+Phases 1-4 have deterministic fallbacks (logged in the run record) so a
+flaky free-tier model degrades the run instead of killing it: a failed
+research turn continues with whatever the tools already fetched, a
+failed digest or compose is rebuilt deterministically, and a failed
+agent-driven save falls back to a direct (still approval-gated) save.
 
 Why the digest subagent and the composer fetch articles themselves
 instead of working from pasted text: the SDK's freshness verifier only
@@ -43,31 +46,33 @@ from .rss import fetch_url_text, search_news_items
 from .tools import FetchedArticle, RunStore, create_tools
 
 RESEARCH_INSTRUCTIONS = (
-    "You are BriefMinion, a research assistant. Use search_news to find "
-    "recent news about the user's topic (it returns a JSON object with a "
-    "'results' list of title, url, published and source), then "
-    "fetch_article for the most relevant results (at most {max_sources}; "
-    "it returns a JSON object with title, url, published_at and text). "
-    "Reply with one line per article you fetched: title and URL. Keep "
-    "working until you have fetched articles or the tools report errors."
+    "You are BriefMinion, a research assistant. Call search_news EXACTLY "
+    "ONCE for the user's topic (it returns a JSON object with a 'results' "
+    "list of title, url, published and source), then call fetch_article "
+    "for at most {max_sources} URLs from those results (it returns a JSON "
+    "object with title, url, published_at and text). If a fetch fails, "
+    "try the next URL from the SAME search results; NEVER search again. "
+    "As soon as you have fetched {max_sources} articles — or a tool says "
+    "the budget is used — STOP calling tools and reply with one line per "
+    "article you fetched: title and URL."
 )
 
 DIGEST_INSTRUCTIONS = (
-    "You distil news articles into facts. First call fetch_article for "
-    "each source URL given by the user, then distil what you fetched. "
-    "Return at most 1200 characters: one short paragraph of key facts "
-    "with dates, then one line per source in the form 'TITLE | DATE | "
-    "one-fact summary'. Use only the articles you fetched; do not invent "
-    "facts."
+    "You distil news articles into facts. Call fetch_article ONCE for "
+    "each source URL given by the user (do not fetch any URL twice), "
+    "then distil what you fetched. Return at most 1200 characters: one "
+    "short paragraph of key facts with dates, then one line per source "
+    "in the form 'TITLE | DATE | one-fact summary'. Use only the "
+    "articles you fetched; do not invent facts."
 )
 
 COMPOSE_INSTRUCTIONS = (
-    "You write research briefs. First verify the sources by calling "
-    "fetch_article for at least one source URL given by the user, then "
-    "return JSON only with fields: title, summary (2-3 sentences), "
-    "key_points (up to 6 short bullets), timeline (up to 6 dated events "
-    "with date and event), sources (title, url, published). Base every "
-    "claim on the digest and sources given; never invent facts or URLs."
+    "You write research briefs. Call fetch_article for exactly ONE "
+    "source URL given by the user to verify it, then return JSON only "
+    "with fields: title, summary (2-3 sentences), key_points (up to 6 "
+    "short bullets), timeline (up to 6 dated events with date and "
+    "event), sources (title, url, published). Base every claim on the "
+    "digest and sources given; never invent facts or URLs."
 )
 
 SAVE_INSTRUCTIONS = (
@@ -216,7 +221,9 @@ def run_brief(
     }
 
     store = RunStore()
-    search_news, fetch_article, save_brief = create_tools(store, out_dir)
+    search_news, fetch_article, save_brief = create_tools(
+        store, out_dir, max_sources=max_sources
+    )
     approval = make_approval_callback(auto_approve)
 
     # Phase 1 — research: the agent drives search + fetch.
@@ -230,13 +237,26 @@ def run_brief(
         forced_tools=["search_news"],
         session_id=session_id,
     ) as agent:
-        research = run_with_retry(
-            agent,
-            f"Research this topic: {topic}",
-            log,
-            timeout_seconds=300,
-        )
-        log(f"research: {research.text.strip()[:300]}")
+        try:
+            research = run_with_retry(
+                agent,
+                f"Research this topic: {topic}",
+                log,
+                timeout_seconds=300,
+            )
+            log(f"research: {research.text.strip()[:300]}")
+        except (ProviderError, TurnTimeoutError) as exc:
+            # The turn failed (rate limit, timeout, or a tripped budget)
+            # but the tools may already have fetched articles: continue
+            # with what the store holds instead of losing the run.
+            if store.articles:
+                record["fallbacks"].append("research-turn")
+                log(
+                    f"research turn failed ({exc}) but {len(store.articles)} "
+                    "article(s) were fetched; continuing with them"
+                )
+            else:
+                raise
 
         if not store.articles and store.search_results:
             record["fallbacks"].append("fetch")

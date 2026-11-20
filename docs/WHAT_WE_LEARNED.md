@@ -3,8 +3,8 @@
 Actionable product feedback from building BriefMinion on OpenMinion 0.1.22
 for Cortensor Hackathon #5. Ordered by impact on the next builder.
 
-> Status: draft from the build phase (20 Nov 2026); extended after the live
-> model runs.
+> Status: extended 20 Nov 2026 after the first live-model runs
+> (OpenRouter free tier) and the mock end-to-end run.
 
 ## 1. Make the echo provider honest about tools
 **Problem:** the credential-free bring-up path silently ignores
@@ -46,9 +46,11 @@ Portal docs page when tool support changes.
 ## 6. Fix (or honestly document) the `auto_fact_extraction` flag
 **Problem:** the top-level `"brain": {"auto_fact_extraction":
 {"enabled": false}}` setting is parsed into `module_configs.brain` but
-does not stop the `submit_output` memory extractor — 12 of 23 requests
-in one brief run were extractor turns. Each one costs a model round trip
-on a paced free tier.
+does not stop the `submit_output` memory extractor. In our current mock
+brief run, 16 of 31 model requests were `submit_output` turns — 8
+freshness-classifier calls, 4 task-revision turns, and 4 memory
+extractor turns that the flag should have gated. Each one costs a model
+round trip on a paced free tier.
 **Suggestion:** make the flag actually gate extraction, or remove it
 from guidance and document the extractor's cost so builders can budget
 for it.
@@ -75,13 +77,45 @@ request is sent.
 **Suggestion:** strip bracketed entries, or build the client with
 `trust_env=False` and explicit proxy support.
 
-## 10. Document free-tier turn budgets
-**Problem:** (to be confirmed in live runs) free-tier models cap tokens
-per minute, while a default agent turn carries a large system prompt plus
-tool schemas. Builders discover the limit by failing.
-**Suggestion:** publish a rough per-turn token budget for the default
-agent configuration, and a `doctor` check that estimates the size of the
-next turn before it is sent.
+## 10. Raise (or scale) the default per-conversation token budget
+**Problem:** the default budget is 100,000 tokens per conversation, and
+the SDK's own per-request context packing burns ~12k estimated tokens
+for a trivial turn — our first live research run exhausted the budget
+mid-task (*"The task, messages and tool schemas exceed the remaining
+token budget"*). A multi-turn tool workflow cannot fit in the default,
+and the failure looks like a model error.
+**Suggestion:** raise the default for tool-using agents, or scale it
+with the number of tools/turns; at minimum, surface the remaining
+budget in the turn error so builders find the
+`OPENMINION_BRAIN_MAX_TOTAL_LLM_TOKENS` override without reading SDK
+source.
+
+## 11. Document the freshness guard — and make its failure diagnosable
+**Problem:** a turn the freshness classifier marks time-sensitive is
+refused unless the agent's own turn produced dated tool evidence — text
+pasted into the prompt does not count. Our digest subagent, given full
+article texts, was replaced by a polite refusal that looked exactly
+like a model failure; only reading
+`modules/brain/runtime/verification/policy.py` explained it. The guard
+itself is reasonable (it forces agents to ground news answers in live
+tool output), but it is undocumented.
+**Suggestion:** document the contract (what counts as evidence, which
+keys are dated, how to satisfy it from a subagent), and include the
+verifier's reason codes in the turn log instead of only in the reply
+text.
+
+## 12. Give the tool loop a convergence signal (or a cheap per-turn cap)
+**Problem:** nothing in the default loop tells an agent "you have
+enough". Our research agent, told to fetch at most 2 articles, searched
+8+ times and made 30 tool calls without concluding — burning a whole
+day's free-tier quota in ~4 minutes. The only SDK-side guard is the
+per-conversation `OPENMINION_BRAIN_MAX_TOOL_CALLS` budget, which fails
+the turn when tripped instead of letting the agent conclude with what
+it has.
+**Suggestion:** add a per-turn tool-call budget that, when reached,
+injects a "budget used — answer with what you have" message into the
+turn instead of erroring, and surface the remaining tool budget in the
+turn log so builders can see a runaway loop forming.
 
 ## What worked well (keep doing this)
 - The `@tool` decorator returning a plain callable makes tools unit-testable

@@ -15,6 +15,22 @@ text) for two reasons:
   that only saw text fails verification (see docs/BUILDING_BLOCKS.md
   finding 17). Every successful result therefore includes
   ``retrieved_at`` (and ``published_at`` when the feed provides it).
+
+The tools also enforce per-run budgets, because a free-tier model in the
+SDK's tool loop does not reliably stop on its own: in our first live
+probe the research agent searched 8+ times with new queries and fetched
+30 articles instead of stopping at 2 (see BUILDING_BLOCKS.md finding
+19). The budgets are deterministic — the model cannot loop past them —
+and every budget refusal tells the model exactly what to do next
+(stop calling tools and answer with what it has):
+
+* ``search_news``: exactly one search per run.
+* ``fetch_article``: new URLs only while fewer than ``max_sources``
+  articles have been fetched successfully, and at most
+  ``max_sources + 4`` distinct fetch attempts (slack for 403s).
+  Re-fetching an already-fetched URL is always allowed and returns the
+  cached text — the digest subagent and the composer re-read the same
+  sources the research phase found.
 """
 
 from __future__ import annotations
@@ -44,14 +60,22 @@ class RunStore:
     search_results: list[NewsItem] = field(default_factory=list)
     articles: list[FetchedArticle] = field(default_factory=list)
     saved_path: str | None = None
+    search_calls: int = 0
+    fetch_attempts: set[str] = field(default_factory=set)
 
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def create_tools(store: RunStore, out_dir: str):
-    """Build the three BriefMinion tools bound to one run store."""
+def create_tools(store: RunStore, out_dir: str, max_sources: int = 4):
+    """Build the three BriefMinion tools bound to one run store.
+
+    ``max_sources`` caps the articles the research phase may fetch; the
+    fetch-attempt budget is ``max_sources + 4`` distinct URLs (slack for
+    publishers that refuse to serve, e.g. HTTP 403).
+    """
+    fetch_attempt_budget = max_sources + 4
 
     @tool(min_scope="READ_ONLY", idempotent=True)
     def search_news(topic: str, max_results: int = 8) -> dict[str, Any]:
@@ -59,7 +83,27 @@ def create_tools(store: RunStore, out_dir: str):
 
         Returns a JSON object: {"query", "retrieved_at", "results"},
         where each result has "title", "url", "published" and "source".
+        Only one search per run: a second call returns an error telling
+        the agent to use the first search's results.
         """
+        if store.search_calls >= 1:
+            if store.search_results:
+                return {
+                    "error": (
+                        "Search already done once for this run. Do not search "
+                        "again. Use the results from the first search: fetch "
+                        "articles from those results, then reply with one line "
+                        "per fetched article."
+                    )
+                }
+            return {
+                "error": (
+                    "The news search already ran and returned nothing "
+                    "usable. Do not search again; reply that no news could "
+                    "be found for this topic."
+                )
+            }
+        store.search_calls += 1
         try:
             items = search_news_items(topic, max_results=max_results)
         except Exception as exc:  # noqa: BLE001 - report to the agent, don't crash the turn
@@ -84,8 +128,48 @@ def create_tools(store: RunStore, out_dir: str):
         """Fetch one article URL and return its visible text (truncated).
 
         Returns a JSON object: {"title", "url", "published_at",
-        "retrieved_at", "text"}.
+        "retrieved_at", "text"}. Re-fetching an already-fetched URL
+        returns the cached text. New URLs are refused once max_sources
+        articles are fetched or the fetch-attempt budget is used up.
         """
+        cached = next(
+            (article for article in store.articles if article.url == url),
+            None,
+        )
+        if cached is not None:
+            return {
+                "title": cached.title,
+                "url": cached.url,
+                "published_at": cached.published,
+                "retrieved_at": _now_iso(),
+                "text": cached.text,
+            }
+        if url in store.fetch_attempts:
+            # Attempted before and failed (a success would be cached
+            # above): do not retry the same dead URL.
+            return {
+                "error": (
+                    f"Already tried {url} and it failed. Do not retry it; "
+                    "try a different URL from the search results, or "
+                    "proceed with the articles you already have."
+                )
+            }
+        if len(store.articles) >= max_sources:
+            return {
+                "error": (
+                    f"You already have {max_sources} fetched articles. "
+                    "Do not call fetch_article again; proceed with the "
+                    "articles you already have."
+                )
+            }
+        if len(store.fetch_attempts) >= fetch_attempt_budget:
+            return {
+                "error": (
+                    "Fetch budget used. Do not call fetch_article again; "
+                    "proceed with the articles you already have."
+                )
+            }
+        store.fetch_attempts.add(url)
         try:
             text = fetch_url_text(url, max_chars=2000)
         except Exception as exc:  # noqa: BLE001 - report to the agent, don't crash the turn
@@ -98,12 +182,9 @@ def create_tools(store: RunStore, out_dir: str):
         )
         title = matched.title if matched else url
         published = matched.published if matched else ""
-        if all(article.url != url for article in store.articles):
-            store.articles.append(
-                FetchedArticle(
-                    url=url, title=title, text=text, published=published
-                )
-            )
+        store.articles.append(
+            FetchedArticle(url=url, title=title, text=text, published=published)
+        )
         return {
             "title": title,
             "url": url,

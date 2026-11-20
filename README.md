@@ -29,19 +29,35 @@ One brief run has four phases, each a separate `Agent` sharing one session
 
 | Phase | What happens | OpenMinion building blocks |
 | --- | --- | --- |
-| 1. Research | The agent drives `search_news` (Google News RSS, keyless) and `fetch_article` itself, picking the most relevant sources | `@tool` (read-only, idempotent), `forced_tools`, sessions |
-| 2. Digest | A bounded subagent distils the fetched articles into dated facts | `subagent()`, timeouts |
-| 3. Compose | The agent returns the brief as Pydantic-validated JSON | `output_type`, `AgentOutputValidationError` |
+| 1. Research | The agent drives `search_news` (Bing News RSS, keyless; Google News fallback) and `fetch_article` itself, picking the most relevant sources | `@tool` (read-only, idempotent), `forced_tools`, sessions |
+| 2. Digest | A bounded subagent fetches the sources itself and distils them into dated facts | `subagent()`, timeouts |
+| 3. Compose | The agent verifies the sources, then returns the brief as Pydantic-validated JSON | `output_type`, `AgentOutputValidationError`, `forced_tools` |
 | 4. Save | The agent calls the approval-gated `save_brief` tool | `dangerous=True` tool, `approval_callback` |
 
 Follow-up questions (`briefminion ask ...`) run in the same session, so the
 agent answers from the brief's context instead of re-searching.
 
+Why the digest subagent and the composer fetch articles themselves instead
+of working from pasted text: the SDK's freshness verifier only accepts
+tool-output evidence produced in the agent's own turn (see
+[docs/BUILDING_BLOCKS.md](docs/BUILDING_BLOCKS.md) finding 17) — a turn
+that only saw pasted text is refused. Each phase reads the sources it
+cites, and the tools return structured results carrying `retrieved_at` /
+`published_at` as dated evidence.
+
 Free-tier reality: model calls are paced (short prompts, truncated article
 text, at most 4 sources) and rate-limit errors are retried with backoff
-(20s / 45s / 75s). If the subagent digest or the agent-driven save fails,
-a deterministic fallback completes the run — and the run record says so
-(see `briefs/<topic>-<date>.run.json`).
+(20s / 45s / 75s). If the subagent digest, the compose step, or the
+agent-driven save fails, a deterministic fallback completes the run — and
+the run record says so (see `briefs/<topic>-<date>.run.json`).
+
+> Token budget: the SDK's default per-conversation budget (100,000) is
+> exhausted mid-research by its own context packing. Live runs need the
+> SDK's env override `OPENMINION_BRAIN_MAX_TOTAL_LLM_TOKENS=1000000`
+> (already set in `demo/run-demo.sh`; see BUILDING_BLOCKS.md finding 16).
+> The tools also enforce per-run budgets (one search, capped fetches)
+> because a free-tier model in the tool loop does not reliably stop on
+> its own (finding 19).
 
 ## Setup
 
@@ -113,12 +129,13 @@ fallbacks used, session id).
 python -m pytest tests/ -q
 ```
 
-28 tests, no model key needed: RSS parsing, HTML stripping, brief
-rendering, tool behaviour (including the save guard), retry/approval
-helpers, HTTP 429 retry — plus two live checks that the keyless Google
-News RSS endpoint and plain HTTP fetch work from the machine, and a full
-end-to-end run of the brief workflow against a scripted local mock model
-(`tests/mock_provider.py`).
+37 tests, no model key needed: RSS parsing (Bing + Google), HTML
+stripping, brief rendering, tool behaviour (including the save guard
+and the per-run tool budgets), retry/approval helpers, HTTP 429 retry
+— plus live checks that the keyless Bing News RSS endpoint (direct
+publisher links) and Google News RSS endpoint work from the machine,
+and a full end-to-end run of the brief workflow against a scripted
+local mock model (`tests/mock_provider.py`).
 
 > Sandbox note: OpenMinion builds its HTTP client with
 > `httpx.Client(trust_env=True)`, and httpx 0.28.1 cannot parse bracketed
@@ -134,9 +151,9 @@ src/briefminion/
   __main__.py   CLI (brief / ask)
   agent.py      workflow orchestration, retry, approval
   tools.py      @tool definitions (search_news, fetch_article, save_brief)
-  rss.py        Google News RSS + article fetching (no API key)
+  rss.py        Bing News RSS (primary) + Google News RSS (fallback) + article fetching (no API key)
   models.py     Brief schema (Pydantic) + Markdown rendering
-tests/          pytest suite (24 tests)
+tests/          pytest suite (37 tests)
 docs/
   BUILDING_BLOCKS.md   OpenMinion blocks tested: what worked, what did not
   WHAT_WE_LEARNED.md   actionable product feedback from building this

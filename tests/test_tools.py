@@ -66,6 +66,10 @@ def test_search_news_reports_errors_instead_of_raising(monkeypatch):
     )
     result = search_news("quantum")
     assert result["error"].startswith("news search failed")
+    # A failed search still consumes the one search: the run's
+    # deterministic fallback (not the model) retries the search.
+    second = search_news("quantum")
+    assert "Do not search again" in second["error"]
 
 
 def test_fetch_article_records_article_once(monkeypatch):
@@ -88,7 +92,71 @@ def test_fetch_article_records_article_once(monkeypatch):
     assert result["text"] == "article body"
     assert result["published_at"] == "Fri, 20 Nov 2026"
     assert result["retrieved_at"]  # dated evidence for the SDK freshness guard
-    fetch_article("https://example.com/a")  # second call: no duplicate
+    fetch_article("https://example.com/a")  # second call: cached, no duplicate
     assert len(store.articles) == 1
     assert store.articles[0].text == "article body"
     assert store.articles[0].published == "Fri, 20 Nov 2026"
+
+
+def test_search_news_allows_only_one_search_per_run(monkeypatch):
+    store = RunStore()
+    search_news, _, _ = create_tools(store, "/tmp")
+    calls = {"n": 0}
+
+    def fake_search(topic, max_results=8):
+        calls["n"] += 1
+        return [
+            NewsItem(title="H", link="https://example.com/h", published="", source="")
+        ]
+
+    monkeypatch.setattr("briefminion.tools.search_news_items", fake_search)
+    assert "results" in search_news("quantum")
+    second = search_news("something else")
+    assert "error" in second
+    assert "Do not search again" in second["error"]
+    assert calls["n"] == 1  # the second call never hit the network
+
+
+def test_fetch_article_refuses_new_urls_after_max_sources(monkeypatch):
+    store = RunStore()
+    _, fetch_article, _ = create_tools(store, "/tmp", max_sources=1)
+    monkeypatch.setattr(
+        "briefminion.tools.fetch_url_text",
+        lambda url, max_chars=2000: "body",
+    )
+    assert "text" in fetch_article("https://example.com/a")
+    refused = fetch_article("https://example.com/b")
+    assert "error" in refused
+    assert len(store.articles) == 1
+
+
+def test_fetch_article_does_not_retry_a_failed_url(monkeypatch):
+    store = RunStore()
+    _, fetch_article, _ = create_tools(store, "/tmp", max_sources=4)
+    calls = {"n": 0}
+
+    def fake_fetch(url, max_chars=2000):
+        calls["n"] += 1
+        raise RuntimeError("403")
+
+    monkeypatch.setattr("briefminion.tools.fetch_url_text", fake_fetch)
+    assert "error" in fetch_article("https://example.com/dead")
+    second = fetch_article("https://example.com/dead")
+    assert "error" in second
+    assert "Already tried" in second["error"]
+    assert calls["n"] == 1  # the retry never hit the network
+
+
+def test_fetch_article_attempt_budget_allows_slack_for_failures(monkeypatch):
+    store = RunStore()
+    _, fetch_article, _ = create_tools(store, "/tmp", max_sources=1)
+    monkeypatch.setattr(
+        "briefminion.tools.fetch_url_text",
+        lambda url, max_chars=2000: (_ for _ in ()).throw(RuntimeError("403")),
+    )
+    # max_sources=1 -> attempt budget 5; the 6th distinct URL is refused.
+    for index in range(5):
+        result = fetch_article(f"https://example.com/dead-{index}")
+        assert "could not fetch" in result["error"]
+    refused = fetch_article("https://example.com/dead-5")
+    assert "Fetch budget used" in refused["error"]
