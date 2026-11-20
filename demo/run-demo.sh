@@ -37,7 +37,13 @@ export OPENMINION_BRAIN_MAX_TOOL_CALLS=30
 TOPIC="decentralized AI inference"
 
 echo "=== BriefMinion demo: researching '$TOPIC' ==="
-briefminion brief "$TOPIC" --max-sources 3 --yes
+# The save step prompts for human approval by default (that approval gate
+# is part of the demo). Set DEMO_AUTO_APPROVE=1 for a non-interactive run.
+if [ "${DEMO_AUTO_APPROVE:-0}" = "1" ]; then
+  briefminion brief "$TOPIC" --max-sources 3 --yes
+else
+  briefminion brief "$TOPIC" --max-sources 3
+fi
 
 BRIEF_FILE=$(ls -t briefs/decentralized-ai-inference-*.md | head -1)
 echo ""

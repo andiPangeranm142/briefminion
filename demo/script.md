@@ -48,12 +48,14 @@ GitHub. A simple agent that works reliably — that was the goal."
    speed up idle waits in edit if needed; never fake the output).
 3. `cat` the saved brief — scroll through summary, key points, sources (25s).
 4. Follow-up `ask` run (20s).
-5. `python -m pytest tests/ -q` — 24 passed (10s).
+5. `python -m pytest tests/ -q` — 37 passed (10s).
 6. End card: repo URL + hackathon name (5s).
 
 ## Recording notes
 - Terminal: 1280x720 capture, font large enough to read at 720p.
 - Do NOT show any API key on screen; keys come from the environment.
+- The demo run uses the real approval prompt (no `--yes`): the `y`
+  keypress approving the save is part of the footage.
 - If the live run hits a free-tier rate limit, the retry backoff is part of
   the honest footage — keep it, or re-record once; do not edit it to look
   instant.
