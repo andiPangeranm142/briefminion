@@ -28,7 +28,7 @@ from openminion import (
 )
 
 from .models import Brief, render_markdown, slugify
-from .rss import fetch_url_text
+from .rss import fetch_url_text, search_news_items
 from .tools import FetchedArticle, RunStore, create_tools
 
 RESEARCH_INSTRUCTIONS = (
@@ -143,6 +143,7 @@ def run_brief(
     out_dir: str = "briefs",
     max_sources: int = 4,
     auto_approve: bool = False,
+    config_path: str | None = None,
     log: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
     """Run the full brief workflow. Returns the run record."""
@@ -170,6 +171,7 @@ def run_brief(
     with Agent(
         agent_id=agent_id,
         model=model,
+        config_path=config_path,
         instructions=RESEARCH_INSTRUCTIONS.format(max_sources=max_sources),
         tools=[search_news, fetch_article],
         forced_tools=["search_news"],
@@ -186,6 +188,17 @@ def run_brief(
         if not store.articles and store.search_results:
             record["fallbacks"].append("fetch")
             _fallback_fetch(store, max_sources, log)
+        if not store.articles and not store.search_results:
+            # The agent's search came back empty (or never ran): one
+            # deterministic direct search + fetch before giving up.
+            record["fallbacks"].append("research")
+            log("agent search returned nothing; trying a direct search")
+            try:
+                store.search_results = search_news_items(topic, max_results=8)
+            except Exception as exc:  # noqa: BLE001 - logged, then give up cleanly
+                log(f"direct search failed: {exc}")
+            if store.search_results:
+                _fallback_fetch(store, max_sources, log)
         if not store.articles:
             raise RuntimeError(
                 "No articles could be fetched for this topic; "
@@ -225,6 +238,7 @@ def run_brief(
     with Agent(
         agent_id=agent_id,
         model=model,
+        config_path=config_path,
         instructions=COMPOSE_INSTRUCTIONS,
         output_type=Brief,
         session_id=session_id,
@@ -252,6 +266,7 @@ def run_brief(
     with Agent(
         agent_id=agent_id,
         model=model,
+        config_path=config_path,
         instructions=SAVE_INSTRUCTIONS,
         tools=[save_brief],
         forced_tools=["save_brief"],
@@ -295,6 +310,7 @@ def run_ask(
     topic: str,
     agent_id: str | None = None,
     model: str | None = None,
+    config_path: str | None = None,
     log: Callable[[str], None] | None = None,
 ) -> str:
     """Ask a follow-up question in the brief's session."""
@@ -303,6 +319,7 @@ def run_ask(
     with Agent(
         agent_id=agent_id,
         model=model,
+        config_path=config_path,
         instructions=ASK_INSTRUCTIONS,
         session_id=session_id,
     ) as agent:

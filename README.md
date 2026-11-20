@@ -113,10 +113,19 @@ fallbacks used, session id).
 python -m pytest tests/ -q
 ```
 
-24 tests, no model key needed: RSS parsing, HTML stripping, brief
+28 tests, no model key needed: RSS parsing, HTML stripping, brief
 rendering, tool behaviour (including the save guard), retry/approval
-helpers — plus two live checks that the keyless Google News RSS endpoint
-and plain HTTP fetch work from the machine.
+helpers, HTTP 429 retry — plus two live checks that the keyless Google
+News RSS endpoint and plain HTTP fetch work from the machine, and a full
+end-to-end run of the brief workflow against a scripted local mock model
+(`tests/mock_provider.py`).
+
+> Sandbox note: OpenMinion builds its HTTP client with
+> `httpx.Client(trust_env=True)`, and httpx 0.28.1 cannot parse bracketed
+> IPv6 entries in `NO_PROXY` (e.g. `[::1]`), failing every provider call
+> before any request is sent. If you hit
+> `InvalidURL: Invalid port: ':1]'`, run with a simplified
+> `NO_PROXY=localhost,127.0.0.1` (see `demo/run-demo.sh`).
 
 ## Project layout
 

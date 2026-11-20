@@ -7,6 +7,11 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 source .venv/bin/activate
 
+# httpx (used by OpenMinion) cannot parse bracketed IPv6 entries in
+# NO_PROXY; simplify it so provider calls work in this sandbox.
+export NO_PROXY=localhost,127.0.0.1
+export no_proxy=localhost,127.0.0.1
+
 TOPIC="decentralized AI inference"
 
 echo "=== BriefMinion demo: researching '$TOPIC' ==="

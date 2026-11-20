@@ -1,7 +1,14 @@
 """Tests for the RSS/news helpers (no model needed)."""
 
+import io
+import urllib.error
+import urllib.request
+
+import pytest
+
 from briefminion.rss import (
     NewsItem,
+    _urlopen_with_retry,
     fetch_url_text,
     html_to_text,
     parse_rss,
@@ -55,6 +62,46 @@ def test_html_to_text_strips_tags_scripts_and_entities():
         "<body><h1>Head &amp; line</h1><p>First  paragraph.</p></body></html>"
     )
     assert html_to_text(html_text) == "Head & line First paragraph."
+
+
+def test_urlopen_retries_429_then_succeeds(monkeypatch):
+    calls = {"n": 0}
+
+    def fake_urlopen(request, timeout):
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise urllib.error.HTTPError(
+                request.full_url, 429, "Too Many Requests", {}, io.BytesIO(b"")
+            )
+        return io.BytesIO(b"ok")
+
+    monkeypatch.setattr("briefminion.rss.urllib.request.urlopen", fake_urlopen)
+    monkeypatch.setattr("briefminion.rss.time.sleep", lambda seconds: None)
+    response = _urlopen_with_retry(
+        urllib.request.Request("https://example.com"),
+        timeout=5,
+    )
+    assert response.read() == b"ok"
+    assert calls["n"] == 3
+
+
+def test_urlopen_does_not_retry_404(monkeypatch):
+    calls = {"n": 0}
+
+    def fake_urlopen(request, timeout):
+        calls["n"] += 1
+        raise urllib.error.HTTPError(
+            request.full_url, 404, "Not Found", {}, io.BytesIO(b"")
+        )
+
+    monkeypatch.setattr("briefminion.rss.urllib.request.urlopen", fake_urlopen)
+    monkeypatch.setattr("briefminion.rss.time.sleep", lambda seconds: None)
+    with pytest.raises(urllib.error.HTTPError):
+        _urlopen_with_retry(
+            urllib.request.Request("https://example.com"),
+            timeout=5,
+        )
+    assert calls["n"] == 1
 
 
 def test_live_google_news_rss_returns_items():

@@ -31,6 +31,7 @@ def build_parser() -> argparse.ArgumentParser:
     brief.add_argument("topic", help="Topic to research")
     brief.add_argument("--agent", default=None, help="Configured OpenMinion agent id")
     brief.add_argument("--model", default=None, help="Model id override")
+    brief.add_argument("--config", default=None, help="Path to agents.json")
     brief.add_argument("--out-dir", default="briefs", help="Output directory")
     brief.add_argument("--max-sources", type=int, default=4)
     brief.add_argument(
@@ -44,6 +45,7 @@ def build_parser() -> argparse.ArgumentParser:
     ask.add_argument("--topic", required=True, help="Topic of the brief to ask about")
     ask.add_argument("--agent", default=None, help="Configured OpenMinion agent id")
     ask.add_argument("--model", default=None, help="Model id override")
+    ask.add_argument("--config", default=None, help="Path to agents.json")
     return parser
 
 
@@ -58,6 +60,7 @@ def main(argv: list[str] | None = None) -> int:
                 out_dir=args.out_dir,
                 max_sources=args.max_sources,
                 auto_approve=args.yes,
+                config_path=args.config,
             )
             print(f"Brief saved: {record['saved_path']}")
             print(f"Title: {record['brief_title']}")
@@ -72,6 +75,7 @@ def main(argv: list[str] | None = None) -> int:
             topic=args.topic,
             agent_id=args.agent,
             model=args.model,
+            config_path=args.config,
         )
         print(answer)
         return 0

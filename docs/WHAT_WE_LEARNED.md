@@ -43,7 +43,39 @@ both statements.
 **Suggestion:** update whichever is stale, and add a dated note to the
 Portal docs page when tool support changes.
 
-## 6. Document free-tier turn budgets
+## 6. Fix (or honestly document) the `auto_fact_extraction` flag
+**Problem:** the top-level `"brain": {"auto_fact_extraction":
+{"enabled": false}}` setting is parsed into `module_configs.brain` but
+does not stop the `submit_output` memory extractor — 12 of 23 requests
+in one brief run were extractor turns. Each one costs a model round trip
+on a paced free tier.
+**Suggestion:** make the flag actually gate extraction, or remove it
+from guidance and document the extractor's cost so builders can budget
+for it.
+
+## 7. Don't require `default_agent` when the caller names the agent
+**Problem:** a multi-agent config fails at construction time unless
+`default_agent` is set, even for `Agent(agent_id="...")`.
+**Suggestion:** resolve the default lazily — only when no explicit agent
+id is given.
+
+## 8. Document the tool-result envelope
+**Problem:** tool results reach the model wrapped in
+`{"status", "summary", "outputs": {"data"}}`. Builders writing local
+test harnesses (or parsing history) must discover the shape by
+inspection.
+**Suggestion:** one paragraph in the Python SDK docs showing the envelope
+and noting the token overhead per tool round trip.
+
+## 9. Sanitize proxy env for the httpx client
+**Problem:** `httpx.Client(trust_env=True)` fails to construct when
+`NO_PROXY` contains bracketed IPv6 entries (`[::1]`), which some
+sandboxes set by default — every provider call then fails before any
+request is sent.
+**Suggestion:** strip bracketed entries, or build the client with
+`trust_env=False` and explicit proxy support.
+
+## 10. Document free-tier turn budgets
 **Problem:** (to be confirmed in live runs) free-tier models cap tokens
 per minute, while a default agent turn carries a large system prompt plus
 tool schemas. Builders discover the limit by failing.
@@ -56,6 +88,11 @@ next turn before it is sent.
   without a model — this shaped our whole test strategy.
 - Provider switching by agent id (`--agent`) with no code change is real:
   the same program runs against echo, OpenRouter, or Portal by config.
+- The provider abstraction made a local mock model possible: pointing the
+  `openai` slot at a scripted localhost server exercised the entire
+  workflow (tools, subagent, structured output, approval, sessions)
+  without any API key. That is a genuinely good property for a hackathon
+  SDK.
 - The SDK examples are copyable and accurate (apart from the `default`
   agent id in finding 2) — `tool_agent.py`, `sessions.py`,
   `structured_output.py`, and `delegation.py` were enough to build this
