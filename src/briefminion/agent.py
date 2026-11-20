@@ -3,12 +3,23 @@
 One brief run has four phases, each a separate Agent sharing one session:
 
 1. Research — the agent drives ``search_news`` + ``fetch_article`` itself.
-2. Digest — a bounded subagent distils the fetched articles into facts.
-3. Compose — the agent returns the brief as validated structured output.
+2. Digest — a bounded subagent fetches the sources itself with
+   ``fetch_article`` and distils them into facts.
+3. Compose — the agent verifies the sources with ``fetch_article``,
+   then returns the brief as validated structured output.
 4. Save — the agent calls the approval-gated ``save_brief`` tool.
 
-Phases 2 and 4 have deterministic fallbacks (logged in the run record) so a
+Phases 2-4 have deterministic fallbacks (logged in the run record) so a
 flaky free-tier model degrades the run instead of killing it.
+
+Why the digest subagent and the composer fetch articles themselves
+instead of working from pasted text: the SDK's freshness verifier only
+accepts tool-output evidence produced in the agent's own turn — text
+pasted into the prompt does not count, and a turn classified as
+time-sensitive with no tool evidence is replaced by a refusal (see
+docs/BUILDING_BLOCKS.md finding 17). Giving each phase its own
+``fetch_article`` call satisfies the guard honestly: each phase reads
+the sources it cites.
 """
 
 from __future__ import annotations
@@ -33,25 +44,30 @@ from .tools import FetchedArticle, RunStore, create_tools
 
 RESEARCH_INSTRUCTIONS = (
     "You are BriefMinion, a research assistant. Use search_news to find "
-    "recent news about the user's topic, then fetch_article for the most "
-    "relevant results (at most {max_sources}). Reply with one line per "
-    "article you fetched: title and URL. Keep working until you have "
-    "fetched articles or the tools report errors."
+    "recent news about the user's topic (it returns a JSON object with a "
+    "'results' list of title, url, published and source), then "
+    "fetch_article for the most relevant results (at most {max_sources}; "
+    "it returns a JSON object with title, url, published_at and text). "
+    "Reply with one line per article you fetched: title and URL. Keep "
+    "working until you have fetched articles or the tools report errors."
 )
 
 DIGEST_INSTRUCTIONS = (
-    "You distil news articles into facts. Return at most 1200 characters: "
-    "one short paragraph of key facts with dates, then one line per source "
-    "in the form 'TITLE | DATE | one-fact summary'. Use only the articles "
-    "given; do not invent facts."
+    "You distil news articles into facts. First call fetch_article for "
+    "each source URL given by the user, then distil what you fetched. "
+    "Return at most 1200 characters: one short paragraph of key facts "
+    "with dates, then one line per source in the form 'TITLE | DATE | "
+    "one-fact summary'. Use only the articles you fetched; do not invent "
+    "facts."
 )
 
 COMPOSE_INSTRUCTIONS = (
-    "You write research briefs. Return JSON only with fields: title, "
-    "summary (2-3 sentences), key_points (up to 6 short bullets), timeline "
-    "(up to 6 dated events with date and event), sources (title, url, "
-    "published). Base every claim on the digest and sources given; never "
-    "invent facts or URLs."
+    "You write research briefs. First verify the sources by calling "
+    "fetch_article for at least one source URL given by the user, then "
+    "return JSON only with fields: title, summary (2-3 sentences), "
+    "key_points (up to 6 short bullets), timeline (up to 6 dated events "
+    "with date and event), sources (title, url, published). Base every "
+    "claim on the digest and sources given; never invent facts or URLs."
 )
 
 SAVE_INSTRUCTIONS = (
@@ -126,7 +142,12 @@ def _fallback_fetch(store: RunStore, max_sources: int, log: Callable[[str], None
             continue
         if text:
             store.articles.append(
-                FetchedArticle(url=item.link, title=item.title, text=text)
+                FetchedArticle(
+                    url=item.link,
+                    title=item.title,
+                    text=text,
+                    published=item.published,
+                )
             )
 
 
@@ -134,6 +155,38 @@ def _digest_fallback(articles: list[FetchedArticle]) -> str:
     """Deterministic fallback digest: truncated article texts, joined."""
     parts = [f"{a.title}\n{a.text[:600]}" for a in articles]
     return "\n\n".join(parts)[:4000]
+
+
+def _compose_fallback(
+    topic: str, digest: str, articles: list[FetchedArticle]
+) -> Brief:
+    """Deterministic fallback brief: digest sentences + source list.
+
+    Used when the composer cannot return valid structured output after
+    retries. Every field comes from fetched material; nothing is invented.
+    """
+    sentences = [s.strip() for s in digest.replace("\n", " ").split(". ") if s.strip()]
+    summary = ". ".join(sentences[:2]).strip()
+    if summary and not summary.endswith("."):
+        summary += "."
+    key_points = [
+        (s[:140] + ("..." if len(s) > 140 else "")).strip()
+        for s in sentences[:6]
+    ]
+    return Brief(
+        title=f"Research brief: {topic}",
+        summary=summary or f"Recent coverage of {topic} (see sources).",
+        key_points=key_points or [f"See the sources on {topic}."],
+        timeline=[],
+        sources=[
+            {
+                "title": a.title,
+                "url": a.url,
+                "published": a.published,
+            }
+            for a in articles
+        ],
+    )
 
 
 def run_brief(
@@ -205,7 +258,9 @@ def run_brief(
                 "search returned nothing usable."
             )
 
-        # Phase 2 — digest: a bounded subagent distils the articles.
+        # Phase 2 — digest: a bounded subagent fetches the sources itself
+        # (so the SDK's freshness verifier sees tool evidence in the
+        # subagent's own turn) and distils them into facts.
         digest_started = time.monotonic()
         digest = ""
         try:
@@ -213,14 +268,16 @@ def run_brief(
                 agent,
                 name="summarizer",
                 instructions=DIGEST_INSTRUCTIONS,
+                tools=[fetch_article],
                 timeout_seconds=180,
             )
-            digest_text = "\n\n".join(
-                f"SOURCE: {a.title}\nURL: {a.url}\n{a.text}"
+            source_list = "\n\n".join(
+                f"SOURCE: {a.title}\nURL: {a.url}\nPublished: {a.published or 'unknown'}"
                 for a in store.articles
             )
             digest = summarizer.run(
-                f"Distil these articles:\n\n{digest_text[:6000]}"
+                "Distil these articles (fetch each URL with fetch_article "
+                f"first, then distil what you fetched):\n\n{source_list}"
             ).text
         except (ProviderError, TurnTimeoutError) as exc:
             record["fallbacks"].append("digest")
@@ -230,17 +287,20 @@ def run_brief(
     record["phases"]["research_seconds"] = round(time.monotonic() - phase_started, 1)
     record["articles_fetched"] = len(store.articles)
 
-    # Phase 3 — compose: validated structured output.
+    # Phase 3 — compose: verified sources, then validated structured output.
     compose_started = time.monotonic()
     source_lines = "\n".join(
         f"- {a.title} | {a.url}" for a in store.articles
     )
+    brief: Brief | None = None
     with Agent(
         agent_id=agent_id,
         model=model,
         config_path=config_path,
         instructions=COMPOSE_INSTRUCTIONS,
         output_type=Brief,
+        tools=[fetch_article],
+        forced_tools=["fetch_article"],
         session_id=session_id,
     ) as composer:
         try:
@@ -251,11 +311,11 @@ def run_brief(
                 log,
                 timeout_seconds=300,
             )
-        except AgentOutputValidationError as exc:
-            raise RuntimeError(
-                f"Model did not return a valid brief JSON: {exc.raw_text[:500]}"
-            ) from exc
-    brief = composed.output
+            brief = composed.output
+        except (AgentOutputValidationError, ProviderError, TurnTimeoutError) as exc:
+            record["fallbacks"].append("compose")
+            log(f"composer failed ({exc}); using deterministic compose fallback")
+            brief = _compose_fallback(topic, digest, store.articles)
     record["phases"]["compose_seconds"] = round(time.monotonic() - compose_started, 1)
 
     markdown = render_markdown(brief, topic, generated_on=day)

@@ -12,6 +12,12 @@ source .venv/bin/activate
 export NO_PROXY=localhost,127.0.0.1
 export no_proxy=localhost,127.0.0.1
 
+# The SDK's default per-conversation token budget is 100,000, and its own
+# per-request context packing burns ~12k estimated tokens per trivial turn,
+# so a multi-turn tool workflow exhausts it mid-research. Raise it via the
+# SDK's own env override (see docs/BUILDING_BLOCKS.md finding 16).
+export OPENMINION_BRAIN_MAX_TOTAL_LLM_TOKENS=1000000
+
 TOPIC="decentralized AI inference"
 
 echo "=== BriefMinion demo: researching '$TOPIC' ==="

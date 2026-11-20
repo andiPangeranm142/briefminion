@@ -3,7 +3,7 @@
 Runs the full BriefMinion workflow — research tools, subagent digest,
 structured-output compose, approval-gated save, follow-up ask — against a
 local OpenAI-compatible server that returns scripted replies. The news
-search and article fetches are real (live Google News RSS); only the model
+search and article fetches are real (live Bing News RSS); only the model
 is mocked.
 """
 

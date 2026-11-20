@@ -3,12 +3,26 @@
 Tools are built by :func:`create_tools` so each run gets its own run-scoped
 store: the agent drives the tools, and the orchestrator reads back what the
 agent found (search results, fetched articles) from the store afterwards.
+
+``search_news`` and ``fetch_article`` return structured dicts (not plain
+text) for two reasons:
+
+* the model reads JSON just as well, and structured results keep titles,
+  URLs and dates unambiguous; and
+* the SDK's freshness verifier only accepts tool-output evidence that
+  carries a dated key (``retrieved_at`` / ``published_at``) in the
+  agent's own turn — a plain-text result has no such keys, so a turn
+  that only saw text fails verification (see docs/BUILDING_BLOCKS.md
+  finding 17). Every successful result therefore includes
+  ``retrieved_at`` (and ``published_at`` when the feed provides it).
 """
 
 from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from typing import Any
 
 from openminion import tool
 
@@ -20,6 +34,7 @@ class FetchedArticle:
     url: str
     title: str
     text: str
+    published: str = ""
 
 
 @dataclass
@@ -31,42 +46,71 @@ class RunStore:
     saved_path: str | None = None
 
 
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
 def create_tools(store: RunStore, out_dir: str):
     """Build the three BriefMinion tools bound to one run store."""
 
     @tool(min_scope="READ_ONLY", idempotent=True)
-    def search_news(topic: str, max_results: int = 8) -> str:
-        """Search live news for a topic. Returns numbered headlines with links."""
+    def search_news(topic: str, max_results: int = 8) -> dict[str, Any]:
+        """Search live news for a topic.
+
+        Returns a JSON object: {"query", "retrieved_at", "results"},
+        where each result has "title", "url", "published" and "source".
+        """
         try:
             items = search_news_items(topic, max_results=max_results)
         except Exception as exc:  # noqa: BLE001 - report to the agent, don't crash the turn
-            return f"ERROR: news search failed: {exc}"
-        if not items:
-            return "No news items found for this topic."
+            return {"error": f"news search failed: {exc}"}
         store.search_results = items
-        lines = []
-        for index, item in enumerate(items, start=1):
-            stamp = f", {item.published}" if item.published else ""
-            source = f" ({item.source})" if item.source else ""
-            lines.append(f"{index}. {item.title}{source}{stamp}\n   {item.link}")
-        return "\n".join(lines)
+        return {
+            "query": topic,
+            "retrieved_at": _now_iso(),
+            "results": [
+                {
+                    "title": item.title,
+                    "url": item.link,
+                    "published": item.published,
+                    "source": item.source,
+                }
+                for item in items
+            ],
+        }
 
     @tool(min_scope="READ_ONLY", idempotent=True)
-    def fetch_article(url: str) -> str:
-        """Fetch one article URL and return its visible text (truncated)."""
+    def fetch_article(url: str) -> dict[str, Any]:
+        """Fetch one article URL and return its visible text (truncated).
+
+        Returns a JSON object: {"title", "url", "published_at",
+        "retrieved_at", "text"}.
+        """
         try:
             text = fetch_url_text(url, max_chars=2000)
         except Exception as exc:  # noqa: BLE001 - report to the agent, don't crash the turn
-            return f"ERROR: could not fetch {url}: {exc}"
+            return {"error": f"could not fetch {url}: {exc}"}
         if not text:
-            return f"ERROR: no readable text at {url}."
-        title = next(
-            (item.title for item in store.search_results if item.link == url),
-            url,
+            return {"error": f"no readable text at {url}"}
+        matched = next(
+            (item for item in store.search_results if item.link == url),
+            None,
         )
+        title = matched.title if matched else url
+        published = matched.published if matched else ""
         if all(article.url != url for article in store.articles):
-            store.articles.append(FetchedArticle(url=url, title=title, text=text))
-        return f"Article: {title}\n{text}"
+            store.articles.append(
+                FetchedArticle(
+                    url=url, title=title, text=text, published=published
+                )
+            )
+        return {
+            "title": title,
+            "url": url,
+            "published_at": published,
+            "retrieved_at": _now_iso(),
+            "text": text,
+        }
 
     @tool(dangerous=True)
     def save_brief(filename: str, content: str) -> str:

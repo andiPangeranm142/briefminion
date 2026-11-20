@@ -11,7 +11,11 @@ from briefminion.rss import (
     _urlopen_with_retry,
     fetch_url_text,
     html_to_text,
+    parse_bing_rss,
     parse_rss,
+    search_bing_news_items,
+    search_bing_url,
+    search_google_news_items,
     search_news_items,
     search_url,
 )
@@ -32,12 +36,49 @@ SAMPLE_RSS = """<?xml version="1.0" encoding="UTF-8"?>
 </channel></rss>
 """
 
+SAMPLE_BING_RSS = """<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0"><channel>
+<title>Bing News</title>
+<item>
+  <title>AI chips race heats up</title>
+  <link>https://www.bing.com/news/apiclick.aspx?ref=FexRss&amp;url=https%3A%2F%2Fexample.com%2Fai-chips</link>
+  <pubDate>Fri, 20 Nov 2026 11:00:00 GMT</pubDate>
+</item>
+<item>
+  <title>Plain link without redirect param</title>
+  <link>https://example.com/plain</link>
+  <pubDate>Thu, 19 Nov 2026 09:00:00 GMT</pubDate>
+</item>
+</channel></rss>
+"""
+
 
 def test_search_url_encodes_topic():
     url = search_url("quantum computing")
     assert url.startswith("https://news.google.com/rss/search?")
     assert "q=quantum+computing" in url
     assert "hl=en-US" in url
+
+
+def test_search_bing_url_encodes_topic():
+    url = search_bing_url("quantum computing")
+    assert url.startswith("https://www.bing.com/news/search?")
+    assert "q=quantum+computing" in url
+    assert "format=rss" in url
+
+
+def test_parse_bing_rss_extracts_direct_url_and_caps_results():
+    items = parse_bing_rss(SAMPLE_BING_RSS, max_results=1)
+    assert len(items) == 1
+    assert items[0].title == "AI chips race heats up"
+    # The apiclick redirect's url= parameter is the real publisher URL.
+    assert items[0].link == "https://example.com/ai-chips"
+    assert items[0].published == "Fri, 20 Nov 2026 11:00:00 GMT"
+
+
+def test_parse_bing_rss_keeps_plain_links():
+    items = parse_bing_rss(SAMPLE_BING_RSS, max_results=8)
+    assert items[1].link == "https://example.com/plain"
 
 
 def test_parse_rss_splits_outlet_and_caps_results():
@@ -105,12 +146,29 @@ def test_urlopen_does_not_retry_404(monkeypatch):
 
 
 def test_live_google_news_rss_returns_items():
-    """Live check: the keyless RSS endpoint works from this machine."""
-    items = search_news_items("quantum computing", max_results=3)
+    """Live check: the keyless Google RSS endpoint works from this machine."""
+    items = search_google_news_items("quantum computing", max_results=3)
     assert len(items) >= 1
     assert isinstance(items[0], NewsItem)
     assert items[0].title
     assert items[0].link.startswith("http")
+
+
+def test_live_bing_news_rss_returns_direct_links():
+    """Live check: Bing RSS works and its links resolve to publishers."""
+    items = search_bing_news_items("quantum computing", max_results=3)
+    assert len(items) >= 1
+    assert isinstance(items[0], NewsItem)
+    assert items[0].title
+    assert items[0].link.startswith("http")
+    assert "bing.com" not in items[0].link  # redirect unwrapped
+
+
+def test_live_search_news_items_prefers_bing():
+    """Live check: the combined search returns fetchable (non-Bing) links."""
+    items = search_news_items("quantum computing", max_results=3)
+    assert len(items) >= 1
+    assert all("bing.com" not in item.link for item in items)
 
 
 def test_live_fetch_url_text_reads_a_real_page():

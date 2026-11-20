@@ -19,17 +19,20 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
-URL_RE = re.compile(r"https?://[^\s\\]+")
+URL_RE = re.compile(r"https?://[^\s\\\",}\]]+")
 
 
 def _unwrap_tool_content(content: str) -> str:
     """Unwrap OpenMinion's JSON tool-result envelope.
 
     Tool results arrive wrapped as
-    {"status": "success", "summary": ..., "outputs": {"data": "<text>"}}.
-    The inner text is JSON-escaped, so newlines show up as literal ``\\n``
-    until the envelope is parsed. Return the inner data, or the raw content
-    when it is not an envelope.
+    {"status": "success", "summary": ..., "outputs": {...}}. For a tool
+    that returns a string, ``outputs`` is ``{"data": "<text>"}`` and the
+    inner text is JSON-escaped, so newlines show up as literal ``\\n``
+    until the envelope is parsed. For a tool that returns a dict, the dict
+    is spread directly into ``outputs`` (no ``data`` key) and ``summary``
+    holds its JSON string. Return the inner value as text, or the raw
+    content when it is not an envelope.
     """
     try:
         parsed = json.loads(content)
@@ -40,7 +43,20 @@ def _unwrap_tool_content(content: str) -> str:
         data = outputs.get("data")
         if isinstance(data, str):
             return data
+        if isinstance(data, dict):
+            return json.dumps(data)
+        if outputs:
+            return json.dumps(outputs)
     return content
+
+
+def _parse_tool_json(text: str) -> dict[str, Any] | None:
+    """Parse a tool result that is a JSON object, else None."""
+    try:
+        parsed = json.loads(text)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
 
 
 def _text_of(message: dict[str, Any]) -> str:
@@ -92,20 +108,72 @@ def _last_user_text(messages: list[dict[str, Any]]) -> str:
     return ""
 
 
+def _all_tool_calls(
+    messages: list[dict[str, Any]],
+) -> list[tuple[str, dict[str, Any]]]:
+    """Return (name, arguments) for every tool call in the conversation.
+
+    Each phase runs as its own turn with a fresh message list, so every
+    tool call in the list belongs to the current phase.
+    """
+    calls = []
+    for message in messages:
+        for call in message.get("tool_calls") or []:
+            function = call.get("function") or {}
+            try:
+                args = json.loads(function.get("arguments") or "{}")
+            except json.JSONDecodeError:
+                args = {}
+            calls.append((function.get("name", ""), args))
+    return calls
+
+
+def _find_phase_prompt(messages: list[dict[str, Any]], prefix: str) -> str:
+    """Find the phase's original user prompt in the conversation.
+
+    After the first tool call the SDK appends "Continue the active task..."
+    as the last user message, so the phase prompt is no longer the last
+    one — scan all user messages instead.
+    """
+    for message in messages:
+        if message.get("role") == "user":
+            text = _text_of(message)
+            if text.startswith(prefix):
+                return text
+    return ""
+
+
 def _source_blocks(prompt: str) -> list[tuple[str, str, str]]:
-    """Parse 'SOURCE: title\\nURL: url\\ntext' blocks from a digest prompt."""
+    """Parse 'SOURCE: title\\nURL: url\\nPublished: date' blocks."""
     blocks = []
     for chunk in prompt.split("SOURCE: ")[1:]:
-        lines = chunk.split("\n", 2)
+        lines = chunk.split("\n")
         title = lines[0].strip() if lines else ""
         url = ""
-        text = ""
-        if len(lines) > 1 and lines[1].startswith("URL: "):
-            url = lines[1][5:].strip()
-        if len(lines) > 2:
-            text = lines[2].strip()
-        blocks.append((title, url, text))
+        published = ""
+        for line in lines[1:]:
+            if line.startswith("URL: "):
+                url = line[5:].strip()
+            elif line.startswith("Published: "):
+                published = line[11:].strip()
+        blocks.append((title, url, published))
     return blocks
+
+
+def _compose_sources(prompt: str) -> list[dict[str, str]]:
+    """Parse the 'Sources:' section of a compose prompt."""
+    sources = []
+    in_sources = False
+    for line in prompt.split("\n"):
+        if line.strip() == "Sources:":
+            in_sources = True
+            continue
+        if in_sources and line.startswith("- "):
+            title, _, url = line[2:].partition(" | ")
+            sources.append(
+                {"title": title.strip(), "url": url.strip(), "published": ""}
+            )
+    return sources
 
 
 class MockDecisions:
@@ -123,7 +191,6 @@ class MockDecisions:
         ]
         results = _tool_results(messages)
         last_user = _last_user_text(messages)
-        result_names = [name for name, _ in results]
 
         if "submit_output" in tools:
             return {"kind": "text", "text": "No facts to extract."}
@@ -139,22 +206,46 @@ class MockDecisions:
             search_text = next(
                 (text for name, text in results if name == "search_news"), ""
             )
-            urls = URL_RE.findall(search_text)
-            fetched = result_names.count("fetch_article")
+            search_json = _parse_tool_json(search_text)
+            if search_json and isinstance(search_json.get("results"), list):
+                urls = [
+                    item.get("url", "")
+                    for item in search_json["results"]
+                    if isinstance(item, dict) and item.get("url")
+                ]
+            else:  # pragma: no cover - plain-text fallback
+                urls = URL_RE.findall(search_text)
+            fetch_results = [
+                text for name, text in results if name == "fetch_article"
+            ]
+            attempts = len(fetch_results)
+            successful = 0
+            for text in fetch_results:
+                parsed_fetch = _parse_tool_json(text)
+                if parsed_fetch is not None and "error" not in parsed_fetch:
+                    successful += 1
             max_sources = _max_sources_from_system(messages)
-            if fetched < max_sources and fetched < len(urls):
+            # Keep fetching until max_sources SUCCEEDED (a 403 must not
+            # end the research early), or the URL list runs out.
+            if successful < max_sources and attempts < len(urls):
                 return {
                     "kind": "tool",
                     "name": "fetch_article",
-                    "arguments": {"url": urls[fetched]},
+                    "arguments": {"url": urls[attempts]},
                 }
-            titles = [
-                line.split("Article:", 1)[-1].strip().split("\n")[0]
-                for name, text in results
-                if name == "fetch_article"
-                for line in text.split("\n")
-                if line.startswith("Article:")
-            ]
+            titles = []
+            for name, text in results:
+                if name != "fetch_article":
+                    continue
+                fetched_json = _parse_tool_json(text)
+                if fetched_json and fetched_json.get("title"):
+                    titles.append(fetched_json["title"])
+                else:  # pragma: no cover - plain-text fallback
+                    titles.extend(
+                        line.split("Article:", 1)[-1].strip().split("\n")[0]
+                        for line in text.split("\n")
+                        if line.startswith("Article:")
+                    )
             listing = "; ".join(titles) if titles else "no articles"
             return {"kind": "text", "text": f"Fetched articles: {listing}."}
 
@@ -169,27 +260,61 @@ class MockDecisions:
                 }
             return {"kind": "text", "text": "Brief saved."}
 
-        if last_user.startswith("Distil these articles:"):
-            blocks = _source_blocks(last_user)
+        digest_prompt = _find_phase_prompt(messages, "Distil these articles")
+        if digest_prompt:
+            # The digest subagent fetches each source itself before
+            # distilling (the SDK freshness guard needs tool evidence in
+            # the subagent's own turn).
+            blocks = _source_blocks(digest_prompt)
+            urls = [url for _title, url, _pub in blocks if url]
+            fetched_urls = {
+                args.get("url")
+                for name, args in _all_tool_calls(messages)
+                if name == "fetch_article"
+            }
+            pending = [url for url in urls if url not in fetched_urls]
+            if pending and "fetch_article" in tools:
+                return {
+                    "kind": "tool",
+                    "name": "fetch_article",
+                    "arguments": {"url": pending[0]},
+                }
             lines = ["Key facts:"]
-            for title, _url, text in blocks:
-                first_sentence = text.split(". ")[0].strip()
+            for name, text in results:
+                if name != "fetch_article":
+                    continue
+                fetched_json = _parse_tool_json(text)
+                if not fetched_json or fetched_json.get("error"):
+                    continue
+                title = fetched_json.get("title", "")
+                first_sentence = (
+                    fetched_json.get("text", "").split(". ")[0].strip()
+                )
                 lines.append(f"- {title}: {first_sentence[:160]}")
+            if len(lines) == 1:  # nothing fetched; note the titles anyway
+                for title, _url, _pub in blocks:
+                    lines.append(f"- {title}: no text fetched.")
             return {"kind": "text", "text": "\n".join(lines)}
 
-        if last_user.startswith("Write the research brief for:"):
-            topic = last_user.split("for:", 1)[-1].split("\n")[0].strip()
-            sources = []
-            in_sources = False
-            for line in last_user.split("\n"):
-                if line.strip() == "Sources:":
-                    in_sources = True
-                    continue
-                if in_sources and line.startswith("- "):
-                    title, _, url = line[2:].partition(" | ")
-                    sources.append(
-                        {"title": title.strip(), "url": url.strip(), "published": ""}
-                    )
+        compose_prompt = _find_phase_prompt(
+            messages, "Write the research brief for:"
+        )
+        if compose_prompt:
+            topic = compose_prompt.split("for:", 1)[-1].split("\n")[0].strip()
+            sources = _compose_sources(compose_prompt)
+            # The composer verifies the sources first: fetch one before
+            # returning the brief JSON.
+            fetched_urls = [
+                args.get("url")
+                for name, args in _all_tool_calls(messages)
+                if name == "fetch_article"
+            ]
+            if "fetch_article" in tools and not fetched_urls and sources:
+                return {
+                    "kind": "tool",
+                    "name": "fetch_article",
+                    "arguments": {"url": sources[0]["url"]},
+                }
             brief = {
                 "title": f"Research brief: {topic}",
                 "summary": (
