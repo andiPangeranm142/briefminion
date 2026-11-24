@@ -253,12 +253,22 @@ unverified live. Fixed in code the same evening: deterministic
 per-run tool budgets + tightened phase instructions + a research-turn
 fallback that continues with already-fetched articles.
 
-### Full live run + video run (pending quota reset)
-OpenRouter's free-model daily quota resets 00:00 UTC (07:00 WIB).
-The full `demo/run-demo.sh` run (brief + follow-up `ask`, real
-approval prompt) and the video recording are scheduled for 21 Nov
-2026 after the reset, with the budgeted tools in place. This section
-is updated with the outcome then.
+### Full live run + video run (21 Nov 2026, completed with fallbacks)
+Topic "decentralized AI inference", Nemotron free via OpenRouter,
+after the quota reset (research+digest probe OK earlier the same
+morning, 222 s). Research + the digest subagent completed live
+(3 articles fetched: HackerNoon 2026-11-05, SiliconAngle 2026-10-06,
+CryptoBriefing 2026-11-03). The composer returned prose instead of
+JSON, so the deterministic compose fallback built the brief (still a
+validated `Brief` model). The agent-driven save ran with real human
+approval ('y' at the prompt) and wrote the brief file at 00:27 UTC;
+the save turn's completion call then hit free-models-per-day 429s
+(retries 20 s / 45 s / 75 s, all failed) and the run fell through to
+the direct-save prompt, where it blocked; the operator ended the run
+at 00:37 UTC. The follow-up `ask` step never ran (no quota left).
+The brief file itself is complete and genuine; the 1:55 demo video
+was recorded from this run's terminal replay. No credits were bought.
+Run record: `briefs/decentralized-ai-inference-2026-11-21.run.json`.
 
 ## Test evidence
 

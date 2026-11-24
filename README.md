@@ -164,7 +164,8 @@ demo/
 
 ## Hackathon submission
 
-- **Demo video:** (YouTube link added after recording)
+- **Demo video:** https://www.youtube.com/watch?v=nSxZCcTDRuU (1:55, filmed live 21 Nov 2026)
+- **DoraHacks Build:** https://dorahacks.io/build/51475 (submitted 21 Nov 2026)
 - **Building blocks tested:** [docs/BUILDING_BLOCKS.md](docs/BUILDING_BLOCKS.md)
 - **What we learned:** [docs/WHAT_WE_LEARNED.md](docs/WHAT_WE_LEARNED.md)
 - **License:** MIT
